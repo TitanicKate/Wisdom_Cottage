@@ -11,14 +11,22 @@ DHT_Unified dht(DHT_PIN, DHT_TYPE);
 // 初始化OLED：软件I2C，SCL和SDA引脚需在实际接线时定义（如#define SCL 22, #define SDA 21）
 U8G2_SSD1306_128X64_NONAME_2_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, SCL, SDA);
 
+// 传感器引脚
+#define PIR_PIN 2
+#define LIGHT_SENSOR_PIN 34
+#define SMOKE_SENSOR_PIN 35
+#define FLAME_SENSOR_PIN 36
+#define RAIN_SENSOR_PIN 32
+#define SOUND_SENSOR_PIN 33
+
 // 执行器引脚
-#define LED_PIN 25
+#define LAMP_PIN 25
 #define WIFI_STATUS_LED_PIN 2
 #define FAN_RELAY_PIN 27
 
 // 按键引脚
 #define MODE_KEY_PIN 13
-#define LIGHT_KEY_PIN 14
+#define LAMP_KEY_PIN 14
 #define CURTAIN_KEY_PIN 15
 #define FAN_KEY_PIN 26
 
@@ -26,24 +34,32 @@ U8G2_SSD1306_128X64_NONAME_2_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, SCL, SDA);
 float temperature = 25.5; // 温度（℃）
 float humidity = 50.0; // 湿度（%）
 int light = 450; // 光照强度（lux）
+int curtainAngle = 0; // 0=关闭，90=打开
+int windowAngle = 0; // 0=打开，90=关闭
+int alarmLine = 0; // 报警显示行切换标记
 bool autoMode = true; // 系统模式（true=自动，false=手动）
 bool ledState = false; // LED灯状态
 bool fanStatus = false; // 风扇状态
+bool isAlarmActive = false; // 报警状态（true=报警中）
 String curtainState = "Open"; // 窗帘状态（Open/Close/Half）
 String windowState = "Open"; // 窗户状态（Open/Close）
-bool isAlarmActive = false; // 报警状态（true=报警中）
 unsigned long alarmDisplayTime = 0; // 报警信息切换计时
-const unsigned long PRINT_INTERVAL = 2000; // 打印间隔（毫秒）
+unsigned long lastPirTime = 0; // 上次检测 Motion Sensor 的时间
 unsigned long previousPrintTime = 0; // 上一次打印的时间戳
-int alarmLine = 0; // 报警显示行切换标记
+unsigned long PRINT_INTERVAL = 2000; // 打印间隔（毫秒）
 
 
 // 主程序功能函数
 void getTempHum();
 void updateOledDisplay();
 void isAutoControl();
+void pirControl();
 void fanControl();
 void printAllDataToSerial();
+void isModeKeyPressed();
+void isLightKeyPressed();
+void isCurtainKeyPressed();
+void isFanKeyPressed();
 
 void setup()
 {
@@ -65,14 +81,20 @@ void loop()
 void init()
 {
     // 初始化引脚
-    pinMode(LED_PIN, OUTPUT);
+    pinMode(LAMP_PIN, OUTPUT);
     pinMode(WIFI_STATUS_LED_PIN, OUTPUT);
     pinMode(FAN_RELAY_PIN, OUTPUT);
 
     pinMode(MODE_KEY_PIN, INPUT_PULLDOWN);
-    pinMode(LIGHT_KEY_PIN, INPUT_PULLDOWN);
+    pinMode(LAMP_KEY_PIN, INPUT_PULLDOWN);
     pinMode(CURTAIN_KEY_PIN, INPUT_PULLDOWN);
     pinMode(FAN_KEY_PIN, INPUT_PULLDOWN);
+
+    // 配置按键引脚中断
+    attachInterrupt(digitalPinToInterrupt(MODE_KEY_PIN), isModeKeyPressed, FALLING);
+    attachInterrupt(digitalPinToInterrupt(LAMP_KEY_PIN), isLightKeyPressed, FALLING);
+    attachInterrupt(digitalPinToInterrupt(CURTAIN_KEY_PIN), isCurtainKeyPressed, FALLING);
+    attachInterrupt(digitalPinToInterrupt(FAN_KEY_PIN), isFanKeyPressed, FALLING);
 
 
     // 初始化串口
@@ -146,7 +168,7 @@ void updateOledDisplay()
 
         sprintf(buf, "Light: %d", light);
         u8g2.drawStr(0, 24, buf);
-        sprintf(buf, "Mode: %s", autoMode ? "Auto" : " Manu");
+        sprintf(buf, "Mode: %s", autoMode ? "Auto" : "Manu");
         u8g2.drawStr(60, 24, buf);
 
         if (isAlarmActive)
@@ -191,6 +213,48 @@ void isAutoControl()
     if (autoMode)
     {
         fanControl();
+    }
+}
+
+/**
+ * 主体控制
+ */
+void pirControl()
+{
+    int pirState = digitalRead(PIR_PIN);
+    if (pirState == HIGH)
+    {
+        lastPirTime = millis();
+        int lightVal = analogRead(LIGHT_SENSOR_PIN);
+        // 光照不足时开灯
+        if (lightVal < 300 && !ledState)
+        {
+            ledState = true;
+            analogWrite(LAMP_PIN, 178);
+        }
+        // 打开窗帘
+        if (curtainAngle == 0)
+        {
+            curtainAngle = 90;
+            // curtainServo.write(curtainAngle);
+        }
+    }
+    else
+    {
+        // 30秒无人关闭设备
+        if (millis() - lastPirTime > 30000)
+        {
+            if (ledState)
+            {
+                ledState = false;
+                analogWrite(LAMP_PIN, 0);
+            }
+            if (curtainAngle == 90)
+            {
+                curtainAngle = 0;
+                // curtainServo.write(curtainAngle);
+            }
+        }
     }
 }
 
@@ -255,5 +319,36 @@ void printAllDataToSerial()
         Serial.print(F("Alarm: "));
         Serial.println(isAlarmActive ? "On" : "Off");
         Serial.println(F("==================="));
+    }
+}
+
+void isModeKeyPressed()
+{
+    autoMode = !autoMode;
+}
+
+void isLightKeyPressed()
+{
+    if (!autoMode)
+    {
+        ledState = !ledState;
+        digitalWrite(LAMP_PIN, ledState ? HIGH : LOW);
+    }
+}
+
+void isFanKeyPressed()
+{
+    if (!autoMode)
+    {
+        fanStatus = !fanStatus;
+        digitalWrite(FAN_RELAY_PIN, fanStatus ? HIGH : LOW);
+    }
+}
+
+void isCurtainKeyPressed()
+{
+    if (!autoMode)
+    {
+
     }
 }
