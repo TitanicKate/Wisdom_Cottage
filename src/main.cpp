@@ -2,6 +2,7 @@
 #include <U8g2lib.h>
 #include <DHT.h>
 #include <DHT_U.h>
+#include <esp32-hal-ledc.h>
 
 // 定义温湿度传感器
 #define DHT_TYPE DHT11
@@ -10,6 +11,22 @@ DHT_Unified dht(DHT_PIN, DHT_TYPE);
 
 // 初始化OLED：软件I2C，SCL和SDA引脚需在实际接线时定义（如#define SCL 22, #define SDA 21）
 U8G2_SSD1306_128X64_NONAME_2_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, SCL, SDA);
+
+// 定义门舵机
+#define DOOR_PIN 12
+#define DOOR_CHANNEL 0
+
+// 定义窗帘舵机
+#define CURTAIN_PIN 19
+#define CURTAIN_CHANNEL 1
+
+// 定义舵机频率和分辨率
+#define FREQ 50
+#define RESOLUTION 12
+
+// 定义舵机角度最大最小值
+#define MIN_ANGLE 0
+#define MAX_ANGLE 180
 
 // 传感器引脚
 #define BODY_SENSOR_PIN 5
@@ -40,17 +57,26 @@ int flame = 0; // 火焰 1=无火焰，0=有火焰
 int smoke = 0; // 烟雾 1=无烟雾，0=有烟雾
 int rain = 0; // 雨量 1=无雨，0=有雨
 int sound = 0; // 1=无声，0=有声
-int curtainAngle = 0; // 0=关闭，90=打开
 int windowAngle = 0; // 0=打开，90=关闭
 int alarmLine = 0; // 报警显示行切换标记
+
 bool autoMode = true; // 系统模式（true=自动，false=手动）
 bool ledState = false; // LED灯状态
 bool fanStatus = false; // 风扇状态
 bool isAlarmActive = false; // 报警状态（true=报警中）
-String curtainState = "Open"; // 窗帘状态（Open/Close/Half）
-String windowState = "Open"; // 窗户状态（Open/Close）
+
+// 窗帘状态变量
+int curtainAngle = 90; // 90=关闭，小于90=打开，大于90=关闭
+bool lastCurtainState = false;
+bool curtainState = false; // 窗帘状态（Open/Close）
+bool isCurtainMoving = false; // 窗帘是否正在移动
+unsigned long curtainActionTime = 0; // 窗帘动作开始时间戳
+unsigned long CURTAIN_MOVE_DURATION = 8000; // 窗帘动作持续时间（8秒）
+
+
+bool doorState = false; // 大门状态（Open/Close）
 unsigned long alarmDisplayTime = 0; // 报警信息切换计时
-unsigned long lastPirTime = 0; // 上次检测 Motion Sensor 的时间
+unsigned long lastPirTime = 0; // 上次检测到人体的时间戳
 unsigned long previousPrintTime = 0; // 上一次打印的时间戳
 unsigned long PRINT_INTERVAL = 2000; // 打印间隔（毫秒）
 unsigned long alarmStartTime = 0; // 报警开始时间戳
@@ -67,6 +93,10 @@ void getSmoke();
 void getFlame();
 void getRain();
 void getSound();
+
+void setServoAngle(int angle, int channel);
+void checkCurtainStatus();
+void checkDoorStatus();
 
 void isAutoControl();
 void bodyControl();
@@ -92,6 +122,8 @@ void loop()
     getSensorsData();
     isAlarmActived();
     isAutoControl();
+    checkCurtainStatus();
+    checkDoorStatus();
     updateOledDisplay();
     printAllDataToSerial();
 }
@@ -119,8 +151,14 @@ void init()
     pinMode(CURTAIN_KEY_PIN, INPUT_PULLDOWN);
     pinMode(FAN_KEY_PIN, INPUT_PULLDOWN);
 
+    // 初始化舵机引脚
+    ledcSetup(DOOR_CHANNEL, FREQ, RESOLUTION);
+    ledcAttachPin(DOOR_PIN, DOOR_CHANNEL);
+    ledcSetup(CURTAIN_CHANNEL, FREQ, RESOLUTION);
+    ledcAttachPin(CURTAIN_PIN, CURTAIN_CHANNEL);
+
     // 配置ADC分辨率
-    // analogReadResolution(12);
+    // analogReadResolution(RESOLUTION);
     // 配置ADC衰减值
     // analogSetAttenuation(ADC_11db);
 
@@ -247,6 +285,106 @@ void getSound()
 }
 
 /**
+ * 设置舵机角度
+ * @param angle 角度
+ * @param channel 通道号
+ */
+void setServoAngle(int angle, int channel)
+{
+    // 限制角度范围（0°~180°）
+    angle = constrain(angle, MIN_ANGLE, MAX_ANGLE);
+
+    // 计算脉冲宽度（0.5ms~2.5ms）
+    // 公式：脉冲宽度 = 0.5ms + (angle/180°)×2ms
+    float pulseWidthMs = 0.5 + (angle / 180.0) * 2.0;
+
+    // 计算占空比（基于LEDC分辨率）
+    // 占空比 = (脉冲宽度 / 周期) × 最大计数值（2^resolution - 1）
+    // 周期 = 1000ms / 频率 = 1000/50 = 20ms
+    int duty = (pulseWidthMs / 20.0) * ((1 << RESOLUTION) - 1);
+
+    // 输出PWM
+    ledcWrite(channel, duty);
+}
+
+/**
+ * 检查窗帘状态
+ */
+void checkCurtainStatus()
+{
+    if (curtainState)
+    {
+        if (curtainState == lastCurtainState)
+        {
+            return;
+        }
+        // 关闭窗帘逻辑：从90°逆时针转到100°（持续8秒），再回到90°停止
+        if (!isCurtainMoving && curtainAngle == 90)
+        {
+            // 开始关闭动作：先转到100°（逆时针）
+            setServoAngle(100, CURTAIN_CHANNEL);
+            curtainAngle = 100;
+            isCurtainMoving = true;
+            curtainActionTime = millis();
+        }
+        // 关闭动作持续8秒后，回到90°停止
+        else if (isCurtainMoving && curtainAngle == 100)
+        {
+            if (millis() - curtainActionTime >= CURTAIN_MOVE_DURATION)
+            {
+                setServoAngle(90, CURTAIN_CHANNEL);
+                curtainAngle = 90;
+                isCurtainMoving = false;
+                lastCurtainState = curtainState;
+            }
+        }
+    }
+    else
+    {
+        if (curtainState == lastCurtainState)
+        {
+            return;
+        }
+        // 打开窗帘逻辑：从90°顺时针转到80°（持续8秒），再回到90°停止
+        if (!isCurtainMoving && curtainAngle == 90)
+        {
+            // 开始打开动作：先转到80°（顺时针）
+            setServoAngle(80, CURTAIN_CHANNEL);
+            curtainAngle = 80;
+            isCurtainMoving = true;
+            curtainActionTime = millis();
+        }
+        // 打开动作持续8秒后，回到90°停止
+        else if (isCurtainMoving && curtainAngle == 80)
+        {
+            if (millis() - curtainActionTime >= CURTAIN_MOVE_DURATION)
+            {
+                setServoAngle(90, CURTAIN_CHANNEL);
+                curtainAngle = 90;
+                isCurtainMoving = false;
+                lastCurtainState = curtainState;
+            }
+        }
+    }
+}
+
+/**
+ * 检查门状态
+ */
+void checkDoorStatus()
+{
+    if (doorState)
+    {
+        setServoAngle(90, DOOR_CHANNEL);
+    }
+    else
+    {
+        setServoAngle(180, DOOR_CHANNEL);
+    }
+}
+
+
+/**
  * 更新OLED显示
  */
 void updateOledDisplay()
@@ -294,9 +432,9 @@ void updateOledDisplay()
         }
         else
         {
-            sprintf(buf, "Curtain: %s", curtainState.c_str());
+            sprintf(buf, "Curtain: %s", curtainState ? "Open" : "Close");
             u8g2.drawStr(0, 48, buf);
-            sprintf(buf, "Window: %s", windowState.c_str());
+            sprintf(buf, "Door: %s", doorState ? "Open" : "Close");
             u8g2.drawStr(0, 60, buf);
         }
     }
@@ -322,38 +460,31 @@ void bodyControl()
 {
     if (body)
     {
+        // 检测到人体，更新计时并执行打开操作
         lastPirTime = millis();
-        // int lightVal = analogRead(LIGHT_SENSOR_PIN);
+
         // 光照不足时开灯
         if (lux && !ledState)
         {
             ledState = true;
-            // analogWrite(LAMP_RELAY_PIN, 178);
-            digitalWrite(LAMP_RELAY_PIN, HIGH);
+            digitalWrite(LAMP_RELAY_PIN, HIGH); // 打开灯光
         }
-        // 打开窗帘
-        if (curtainAngle == 0)
-        {
-            curtainAngle = 90;
-            // curtainServo.write(curtainAngle);
-        }
+
+        curtainState = true;
     }
     else
     {
-        // 30秒无人关闭设备
+        // 未检测到人体，30秒后关闭设备
         if (millis() - lastPirTime > 30000)
         {
+            // 关闭灯光
             if (ledState)
             {
                 ledState = false;
-                // analogWrite(LAMP_RELAY_PIN, 0);
-                digitalWrite(LAMP_RELAY_PIN, LOW);
+                digitalWrite(LAMP_RELAY_PIN, LOW); // 关闭灯光
             }
-            if (curtainAngle == 90)
-            {
-                curtainAngle = 0;
-                // curtainServo.write(curtainAngle);
-            }
+
+            curtainState = false;
         }
     }
 }
@@ -469,8 +600,8 @@ void printAllDataToSerial()
         Serial.println(fanStatus ? "On" : "Off");
         Serial.print(F("Curtain: "));
         Serial.print(curtainState);
-        Serial.print(F("  Window: "));
-        Serial.println(windowState);
+        Serial.print(F("  Door: "));
+        Serial.println(doorState);
         Serial.print(F("Alarm: "));
         Serial.println(isAlarmActive ? "On" : "Off");
         Serial.println(F("==================="));
@@ -504,5 +635,6 @@ void isCurtainKeyPressed()
 {
     if (!autoMode)
     {
+        curtainState = !curtainState;
     }
 }
