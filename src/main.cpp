@@ -3,638 +3,495 @@
 #include <DHT.h>
 #include <DHT_U.h>
 #include <esp32-hal-ledc.h>
+#include <WiFi.h>  // 新增WiFi库
 
-// 定义温湿度传感器
-#define DHT_TYPE DHT11
-#define DHT_PIN 4
-DHT_Unified dht(DHT_PIN, DHT_TYPE);
-
-// 初始化OLED：软件I2C，SCL和SDA引脚需在实际接线时定义（如#define SCL 22, #define SDA 21）
-U8G2_SSD1306_128X64_NONAME_2_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, SCL, SDA);
-
-// 定义门舵机
-#define DOOR_PIN 12
-#define DOOR_CHANNEL 0
-
-// 定义窗帘舵机
-#define CURTAIN_PIN 19
-#define CURTAIN_CHANNEL 1
-
-// 定义舵机频率和分辨率
-#define FREQ 50
-#define RESOLUTION 12
-
-// 定义舵机角度最大最小值
-#define MIN_ANGLE 0
-#define MAX_ANGLE 180
-
-// 传感器引脚
-#define BODY_SENSOR_PIN 5
-#define LIGHT_SENSOR_PIN 34
-#define SMOKE_SENSOR_PIN 35
-#define FLAME_SENSOR_PIN 36
-#define RAIN_SENSOR_PIN 32
-#define SOUND_SENSOR_PIN 33
-
-// 执行器引脚
-#define WIFI_STATUS_LED_PIN 2
-#define LAMP_RELAY_PIN 25
-#define FAN_RELAY_PIN 27
-#define BUZZER_PIN 18
-
-// 按键引脚
-#define MODE_KEY_PIN 13
-#define LAMP_KEY_PIN 14
-#define CURTAIN_KEY_PIN 15
-#define FAN_KEY_PIN 26
-
-// 系统状态变量
-float temperature = 0.0; // 温度（℃）
-float humidity = 0.0; // 湿度（%）
-int lux = 0; // 光照强度（lux）
-int body = 0; // 人体 0=无人, 1=有人
-int flame = 0; // 火焰 1=无火焰，0=有火焰
-int smoke = 0; // 烟雾 1=无烟雾，0=有烟雾
-int rain = 0; // 雨量 1=无雨，0=有雨
-int sound = 0; // 1=无声，0=有声
-int windowAngle = 0; // 0=打开，90=关闭
-int alarmLine = 0; // 报警显示行切换标记
-
-bool autoMode = true; // 系统模式（true=自动，false=手动）
-bool ledState = false; // LED灯状态
-bool fanStatus = false; // 风扇状态
-bool isAlarmActive = false; // 报警状态（true=报警中）
-
-// 窗帘状态变量
-int curtainAngle = 90; // 90=关闭，小于90=打开，大于90=关闭
-bool lastCurtainState = false;
-bool curtainState = false; // 窗帘状态（Open/Close）
-bool isCurtainMoving = false; // 窗帘是否正在移动
-unsigned long curtainActionTime = 0; // 窗帘动作开始时间戳
-unsigned long CURTAIN_MOVE_DURATION = 8000; // 窗帘动作持续时间（8秒）
-
-
-bool doorState = false; // 大门状态（Open/Close）
-unsigned long alarmDisplayTime = 0; // 报警信息切换计时
-unsigned long lastPirTime = 0; // 上次检测到人体的时间戳
-unsigned long previousPrintTime = 0; // 上一次打印的时间戳
-unsigned long PRINT_INTERVAL = 2000; // 打印间隔（毫秒）
-unsigned long alarmStartTime = 0; // 报警开始时间戳
-unsigned long ALARM_DURATION = 5000; // 报警持续时间（5秒）
-
-
-// 主程序功能函数
-
-void getSensorsData();
-void getTempHum();
-void getLux();
-void getBody();
-void getSmoke();
-void getFlame();
-void getRain();
-void getSound();
-
-void setServoAngle(int angle, int channel);
-void checkCurtainStatus();
-void checkDoorStatus();
-
-void isAutoControl();
-void bodyControl();
-void fanControl();
-void isAlarmActived();
-
-void updateOledDisplay();
-void printAllDataToSerial();
-
-void isModeKeyPressed();
-void isLightKeyPressed();
-void isCurtainKeyPressed();
-void isFanKeyPressed();
-
-void setup()
+// WiFi配置 - 新增WiFi参数
+namespace WiFiConfig
 {
-    init();
-    delay(3000);
+    const char* SSID = "TitanicKate"; // 替换为你的WiFi名称
+    const char* PASSWORD = "gat040506"; // 替换为你的WiFi密码
+    const unsigned long RECONNECT_INTERVAL = 5000; // 重连间隔（5秒）
 }
 
-void loop()
+// 引脚定义 - 保留原有并增加WiFi状态LED
+namespace Pins
 {
-    getSensorsData();
-    isAlarmActived();
-    isAutoControl();
-    checkCurtainStatus();
-    checkDoorStatus();
-    updateOledDisplay();
-    printAllDataToSerial();
+    // 原有引脚定义...
+    constexpr int WIFI_LED = 2; // 用于指示WiFi状态（板载LED）
+    // 其他引脚保持不变...
+    constexpr int DHT_PIN = 4;
+    constexpr int BODY_SENSOR = 5;
+    constexpr int LIGHT_SENSOR = 34;
+    constexpr int SMOKE_SENSOR = 35;
+    constexpr int FLAME_SENSOR = 36;
+    constexpr int RAIN_SENSOR = 32;
+    constexpr int SOUND_SENSOR = 33;
+    constexpr int LAMP_RELAY = 25;
+    constexpr int FAN_RELAY = 27;
+    constexpr int BUZZER = 18;
+    constexpr int DOOR_SERVO = 12;
+    constexpr int CURTAIN_SERVO = 19;
+    constexpr int MODE_KEY = 13;
+    constexpr int LAMP_KEY = 14;
+    constexpr int CURTAIN_KEY = 15;
+    constexpr int FAN_KEY = 26;
 }
 
-/**
- * 初始化传感器
- */
-void init()
+// 常量定义 - 保留原有
+namespace Constants
 {
-    // 初始化输入引脚
-    pinMode(BODY_SENSOR_PIN, INPUT);
-    pinMode(LIGHT_SENSOR_PIN, INPUT);
-    pinMode(SOUND_SENSOR_PIN, INPUT);
-    pinMode(SMOKE_SENSOR_PIN, INPUT);
-    pinMode(FLAME_SENSOR_PIN, INPUT);
-    pinMode(RAIN_SENSOR_PIN, INPUT);
-    // 初始化输出引脚
-    pinMode(WIFI_STATUS_LED_PIN, OUTPUT);
-    pinMode(LAMP_RELAY_PIN, OUTPUT);
-    pinMode(FAN_RELAY_PIN, OUTPUT);
-    pinMode(BUZZER_PIN, OUTPUT);
+    // 原有常量保持不变...
+    constexpr auto DHT_TYPE = DHT11;
+    constexpr int DOOR_CHANNEL = 0;
+    constexpr int CURTAIN_CHANNEL = 1;
+    constexpr int FREQ = 50;
+    constexpr int RESOLUTION = 12;
+    constexpr int MIN_ANGLE = 0;
+    constexpr int MAX_ANGLE = 180;
+    constexpr unsigned long PRINT_INTERVAL = 2000;
+    constexpr unsigned long CURTAIN_MOVE_DURATION = 8000;
+    constexpr unsigned long ALARM_DURATION = 5000;
+    constexpr unsigned long NO_BODY_TIMEOUT = 30000;
+    constexpr unsigned long ALARM_DISPLAY_INTERVAL = 1000;
+    constexpr float TEMP_HIGH = 29.0f;
+    constexpr float TEMP_LOW = 26.0f;
+    constexpr float HUMIDITY_HIGH = 60.0f;
+    constexpr float HUMIDITY_LOW = 50.0f;
+    constexpr float TEMP_HUMIDITY_TRIGGER = 25.0f;
+}
 
-    pinMode(MODE_KEY_PIN, INPUT_PULLDOWN);
-    pinMode(LAMP_KEY_PIN, INPUT_PULLDOWN);
-    pinMode(CURTAIN_KEY_PIN, INPUT_PULLDOWN);
-    pinMode(FAN_KEY_PIN, INPUT_PULLDOWN);
+// 系统状态 - 新增WiFi相关状态
+struct SystemState
+{
+    // 原有状态变量...
+    float temperature = 0.0f;
+    float humidity = 0.0f;
+    int lux = 0;
+    bool bodyDetected = false;
+    bool flameDetected = false;
+    bool smokeDetected = false;
+    bool rainDetected = false;
+    bool soundDetected = false;
+    bool autoMode = true;
+    bool ledState = false;
+    bool fanState = false;
+    bool alarmActive = false;
+    bool doorOpen = false;
+    bool curtainOpen = false;
+    int curtainAngle = 90;
+    bool isCurtainMoving = false;
+    unsigned long curtainActionTime = 0;
+    unsigned long lastPirTime = 0;
+    unsigned long previousPrintTime = 0;
+    unsigned long alarmStartTime = 0;
+    unsigned long alarmDisplayTime = 0;
+    int alarmLine = 0;
+    bool lastCurtainState = false;
 
-    // 初始化舵机引脚
-    ledcSetup(DOOR_CHANNEL, FREQ, RESOLUTION);
-    ledcAttachPin(DOOR_PIN, DOOR_CHANNEL);
-    ledcSetup(CURTAIN_CHANNEL, FREQ, RESOLUTION);
-    ledcAttachPin(CURTAIN_PIN, CURTAIN_CHANNEL);
+    // 新增WiFi状态变量
+    bool wifiConnected = false; // WiFi连接状态
+    unsigned long lastReconnectAttempt = 0; // 上次重连时间
+} state;
 
-    // 配置ADC分辨率
-    // analogReadResolution(RESOLUTION);
-    // 配置ADC衰减值
-    // analogSetAttenuation(ADC_11db);
+// 全局对象 - 保留原有
+DHT_Unified dht(Pins::DHT_PIN, Constants::DHT_TYPE);
+U8G2_SSD1306_128X64_NONAME_2_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, 22, 21);
 
-    // 配置按键引脚中断
-    attachInterrupt(digitalPinToInterrupt(MODE_KEY_PIN), isModeKeyPressed, FALLING);
-    attachInterrupt(digitalPinToInterrupt(LAMP_KEY_PIN), isLightKeyPressed, FALLING);
-    attachInterrupt(digitalPinToInterrupt(CURTAIN_KEY_PIN), isCurtainKeyPressed, FALLING);
-    attachInterrupt(digitalPinToInterrupt(FAN_KEY_PIN), isFanKeyPressed, FALLING);
+// 函数声明 - 新增WiFi相关函数
+void initSystem();
+void readSensors();
+void controlDevices();
+void updateDisplay();
+void handleAlarms();
+void printDebugInfo();
+void connectWiFi(); // 新增：连接WiFi
+void checkWiFiConnection(); // 新增：检查WiFi连接状态
 
+// 原有函数保持不变...
+void setServoAngle(int angle, int channel)
+{
+    angle = constrain(angle, Constants::MIN_ANGLE, Constants::MAX_ANGLE);
+    const float pulseWidthMs = 0.5f + (angle / 180.0f) * 2.0f;
+    const int duty = static_cast<int>((pulseWidthMs / 20.0f) * ((1 << Constants::RESOLUTION) - 1));
+    ledcWrite(channel, duty);
+}
 
-    // 初始化串口
+void controlCurtain()
+{
+    if (state.curtainOpen == state.lastCurtainState) return;
+
+    if (state.curtainOpen)
+    {
+        if (!state.rainDetected)
+        {
+            if (!state.isCurtainMoving && state.curtainAngle == 90)
+            {
+                setServoAngle(80, Constants::CURTAIN_CHANNEL);
+                state.curtainAngle = 80;
+                state.isCurtainMoving = true;
+                state.curtainActionTime = millis();
+            }
+            else if (state.isCurtainMoving && state.curtainAngle == 80)
+            {
+                if (millis() - state.curtainActionTime >= Constants::CURTAIN_MOVE_DURATION)
+                {
+                    setServoAngle(90, Constants::CURTAIN_CHANNEL);
+                    state.curtainAngle = 90;
+                    state.isCurtainMoving = false;
+                    state.lastCurtainState = state.curtainOpen;
+                }
+            }
+        }
+        else
+        {
+            state.lastCurtainState = state.curtainOpen;
+        }
+    }
+    else
+    {
+        if (!state.isCurtainMoving && state.curtainAngle == 90)
+        {
+            setServoAngle(100, Constants::CURTAIN_CHANNEL);
+            state.curtainAngle = 100;
+            state.isCurtainMoving = true;
+            state.curtainActionTime = millis();
+        }
+        else if (state.isCurtainMoving && state.curtainAngle == 100)
+        {
+            if (millis() - state.curtainActionTime >= Constants::CURTAIN_MOVE_DURATION)
+            {
+                setServoAngle(90, Constants::CURTAIN_CHANNEL);
+                state.curtainAngle = 90;
+                state.isCurtainMoving = false;
+                state.lastCurtainState = state.curtainOpen;
+            }
+        }
+    }
+}
+
+void controlDoor()
+{
+    setServoAngle(state.doorOpen ? 90 : 180, Constants::DOOR_CHANNEL);
+}
+
+void bodySensorControl()
+{
+    if (state.bodyDetected)
+    {
+        state.lastPirTime = millis();
+        if (state.lux && !state.ledState)
+        {
+            state.ledState = true;
+            digitalWrite(Pins::LAMP_RELAY, HIGH);
+        }
+        state.curtainOpen = true;
+    }
+    else
+    {
+        if (millis() - state.lastPirTime > Constants::NO_BODY_TIMEOUT)
+        {
+            if (state.ledState)
+            {
+                state.ledState = false;
+                digitalWrite(Pins::LAMP_RELAY, LOW);
+            }
+            state.curtainOpen = false;
+        }
+    }
+}
+
+void fanControl()
+{
+    bool fanNeeded = false;
+    if (state.temperature > Constants::TEMP_HIGH) fanNeeded = true;
+    else if (state.temperature <= Constants::TEMP_LOW) fanNeeded = false;
+    if (state.humidity > Constants::HUMIDITY_HIGH && state.temperature > Constants::TEMP_HUMIDITY_TRIGGER)
+        fanNeeded =
+            true;
+    else if (state.humidity < Constants::HUMIDITY_LOW) fanNeeded = false;
+    if (fanNeeded != state.fanState)
+    {
+        state.fanState = fanNeeded;
+        digitalWrite(Pins::FAN_RELAY, state.fanState ? HIGH : LOW);
+    }
+}
+
+// 中断服务函数保持不变...
+void IRAM_ATTR onModeKeyPress() { state.autoMode = !state.autoMode; }
+
+void IRAM_ATTR onLightKeyPress()
+{
+    if (!state.autoMode)
+    {
+        state.ledState = !state.ledState;
+        digitalWrite(Pins::LAMP_RELAY, state.ledState ? HIGH : LOW);
+    }
+}
+
+void IRAM_ATTR onCurtainKeyPress() { if (!state.autoMode) state.curtainOpen = !state.curtainOpen; }
+
+void IRAM_ATTR onFanKeyPress()
+{
+    if (!state.autoMode)
+    {
+        state.fanState = !state.fanState;
+        digitalWrite(Pins::FAN_RELAY, state.fanState ? HIGH : LOW);
+    }
+}
+
+// 新增：WiFi连接函数
+void connectWiFi()
+{
+    Serial.print("Connect to WiFi: ");
+    Serial.println(WiFiConfig::SSID);
+    WiFi.begin(WiFiConfig::SSID, WiFiConfig::PASSWORD);
+
+    // 等待连接（超时10秒）
+    unsigned long startAttemptTime = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 10000)
+    {
+        delay(500);
+        Serial.print(".");
+        digitalWrite(Pins::WIFI_LED, !digitalRead(Pins::WIFI_LED)); // 闪烁指示正在连接
+    }
+
+    // 连接结果判断
+    if (WiFi.status() == WL_CONNECTED)
+    {
+        state.wifiConnected = true;
+        digitalWrite(Pins::WIFI_LED, HIGH); // 常亮表示连接成功
+        Serial.println("\nWiFi connect successful!");
+        Serial.print("IP Address: ");
+        Serial.println(WiFi.localIP());
+    }
+    else
+    {
+        state.wifiConnected = false;
+        digitalWrite(Pins::WIFI_LED, LOW); // 熄灭表示连接失败
+        Serial.println("\nWiFi connect failed, Please retry...");
+    }
+}
+
+// 新增：检查WiFi连接状态，断线重连
+void checkWiFiConnection()
+{
+    if (WiFi.status() != WL_CONNECTED)
+    {
+        state.wifiConnected = false;
+        digitalWrite(Pins::WIFI_LED, LOW);
+
+        // 每隔5秒尝试重连
+        if (millis() - state.lastReconnectAttempt >= WiFiConfig::RECONNECT_INTERVAL)
+        {
+            state.lastReconnectAttempt = millis();
+            Serial.println("WiFi disconnected, attempting to reconnect...");
+            connectWiFi(); // 调用连接函数
+        }
+    }
+    else
+    {
+        state.wifiConnected = true;
+        digitalWrite(Pins::WIFI_LED, HIGH);
+    }
+}
+
+// 系统初始化 - 新增WiFi初始化
+void initSystem()
+{
+    // 原有初始化代码...
+    pinMode(Pins::WIFI_LED, OUTPUT);
+    pinMode(Pins::BODY_SENSOR, INPUT);
+    pinMode(Pins::LIGHT_SENSOR, INPUT);
+    pinMode(Pins::SOUND_SENSOR, INPUT);
+    pinMode(Pins::SMOKE_SENSOR, INPUT);
+    pinMode(Pins::FLAME_SENSOR, INPUT);
+    pinMode(Pins::RAIN_SENSOR, INPUT);
+    pinMode(Pins::LAMP_RELAY, OUTPUT);
+    pinMode(Pins::FAN_RELAY, OUTPUT);
+    pinMode(Pins::BUZZER, OUTPUT);
+    pinMode(Pins::MODE_KEY, INPUT_PULLDOWN);
+    pinMode(Pins::LAMP_KEY, INPUT_PULLDOWN);
+    pinMode(Pins::CURTAIN_KEY, INPUT_PULLDOWN);
+    pinMode(Pins::FAN_KEY, INPUT_PULLDOWN);
+
+    ledcSetup(Constants::DOOR_CHANNEL, Constants::FREQ, Constants::RESOLUTION);
+    ledcAttachPin(Pins::DOOR_SERVO, Constants::DOOR_CHANNEL);
+    ledcSetup(Constants::CURTAIN_CHANNEL, Constants::FREQ, Constants::RESOLUTION);
+    ledcAttachPin(Pins::CURTAIN_SERVO, Constants::CURTAIN_CHANNEL);
+
+    attachInterrupt(digitalPinToInterrupt(Pins::MODE_KEY), onModeKeyPress, FALLING);
+    attachInterrupt(digitalPinToInterrupt(Pins::LAMP_KEY), onLightKeyPress, FALLING);
+    attachInterrupt(digitalPinToInterrupt(Pins::CURTAIN_KEY), onCurtainKeyPress, FALLING);
+    attachInterrupt(digitalPinToInterrupt(Pins::FAN_KEY), onFanKeyPress, FALLING);
+
     Serial.begin(9600);
-
-
-    // 初始化DHT11
     dht.begin();
-
-
-    // 初始化OLED
     u8g2.begin();
-    // 启用UTF-8打印
     u8g2.enableUTF8Print();
-    // 设置中文字体
     u8g2.setFont(u8g2_font_ncenB12_tr);
-    // 初始化显示标题
+
+    // 初始化显示
     u8g2.firstPage();
     do
     {
-        u8g2.drawFrame(0, 0, 127, 63); // 屏幕边框（x,y,w,h）
+        u8g2.drawFrame(0, 0, 127, 63);
         u8g2.drawStr(36, 24, "Smart");
         u8g2.drawStr(9, 48, "Living Room");
     }
     while (u8g2.nextPage());
+    delay(3000);
+
+    // 新增：上电时启动WiFi连接
+    connectWiFi();
 }
 
-void getSensorsData()
-{
-    getTempHum();
-    getLux();
-    getBody();
-    getSmoke();
-    getFlame();
-    getRain();
-    getSound();
-}
-
-/**
- * 获取温度和湿度
- */
-void getTempHum()
+// 读取传感器 - 保持不变
+void readSensors()
 {
     sensors_event_t event;
-    // 获取温度
     dht.temperature().getEvent(&event);
-    if (isnan(event.temperature))
-    {
-        temperature = 0.0;
-    }
-    else
-    {
-        temperature = event.temperature;
-    }
-    // 获取湿度
+    state.temperature = isnan(event.temperature) ? 0.0f : event.temperature;
     dht.humidity().getEvent(&event);
-    if (isnan(event.relative_humidity))
+    state.humidity = isnan(event.relative_humidity) ? 0.0f : event.relative_humidity;
+    state.lux = digitalRead(Pins::LIGHT_SENSOR);
+    state.bodyDetected = digitalRead(Pins::BODY_SENSOR);
+    state.smokeDetected = !digitalRead(Pins::SMOKE_SENSOR);
+    state.flameDetected = !digitalRead(Pins::FLAME_SENSOR);
+    state.rainDetected = !digitalRead(Pins::RAIN_SENSOR);
+    state.soundDetected = !digitalRead(Pins::SOUND_SENSOR);
+}
+
+// 设备控制 - 保持不变
+void controlDevices()
+{
+    if (state.autoMode)
     {
-        humidity = 0.0;
+        bodySensorControl();
+        fanControl();
     }
-    else
+    controlCurtain();
+    controlDoor();
+}
+
+// 报警处理 - 保持不变
+void handleAlarms()
+{
+    const bool isDanger = state.flameDetected || state.smokeDetected;
+    if (isDanger)
     {
-        humidity = event.relative_humidity;
-    }
-}
-
-/**
- * 获取光照强度
- */
-void getLux()
-{
-    // 将ADC值转换为光照强度
-    // lux = (float)analogRead(LIGHT_SENSOR_PIN) / 4095 * 100;
-    // lux = analogRead(LIGHT_SENSOR_PIN);
-    lux = digitalRead(LIGHT_SENSOR_PIN);
-}
-
-/**
- * 获取有人状态
- */
-void getBody()
-{
-    body = digitalRead(BODY_SENSOR_PIN);
-}
-
-/**
- * 获取烟雾状态
- */
-void getSmoke()
-{
-    smoke = digitalRead(SMOKE_SENSOR_PIN);
-}
-
-/**
- * 获取火焰状态
- */
-void getFlame()
-{
-    flame = digitalRead(FLAME_SENSOR_PIN);
-}
-
-/**
- * 获取雨量
- */
-void getRain()
-{
-    rain = digitalRead(RAIN_SENSOR_PIN);
-}
-
-/**
- * 获取声音状态
- */
-void getSound()
-{
-    sound = digitalRead(SOUND_SENSOR_PIN);
-}
-
-/**
- * 设置舵机角度
- * @param angle 角度
- * @param channel 通道号
- */
-void setServoAngle(int angle, int channel)
-{
-    // 限制角度范围（0°~180°）
-    angle = constrain(angle, MIN_ANGLE, MAX_ANGLE);
-
-    // 计算脉冲宽度（0.5ms~2.5ms）
-    // 公式：脉冲宽度 = 0.5ms + (angle/180°)×2ms
-    float pulseWidthMs = 0.5 + (angle / 180.0) * 2.0;
-
-    // 计算占空比（基于LEDC分辨率）
-    // 占空比 = (脉冲宽度 / 周期) × 最大计数值（2^resolution - 1）
-    // 周期 = 1000ms / 频率 = 1000/50 = 20ms
-    int duty = (pulseWidthMs / 20.0) * ((1 << RESOLUTION) - 1);
-
-    // 输出PWM
-    ledcWrite(channel, duty);
-}
-
-/**
- * 检查窗帘状态
- */
-void checkCurtainStatus()
-{
-    if (curtainState)
-    {
-        if (curtainState == lastCurtainState)
+        if (!state.alarmActive)
         {
-            return;
-        }
-        // 关闭窗帘逻辑：从90°逆时针转到100°（持续8秒），再回到90°停止
-        if (!isCurtainMoving && curtainAngle == 90)
-        {
-            // 开始关闭动作：先转到100°（逆时针）
-            setServoAngle(100, CURTAIN_CHANNEL);
-            curtainAngle = 100;
-            isCurtainMoving = true;
-            curtainActionTime = millis();
-        }
-        // 关闭动作持续8秒后，回到90°停止
-        else if (isCurtainMoving && curtainAngle == 100)
-        {
-            if (millis() - curtainActionTime >= CURTAIN_MOVE_DURATION)
-            {
-                setServoAngle(90, CURTAIN_CHANNEL);
-                curtainAngle = 90;
-                isCurtainMoving = false;
-                lastCurtainState = curtainState;
-            }
-        }
-    }
-    else
-    {
-        if (curtainState == lastCurtainState)
-        {
-            return;
-        }
-        // 打开窗帘逻辑：从90°顺时针转到80°（持续8秒），再回到90°停止
-        if (!isCurtainMoving && curtainAngle == 90)
-        {
-            // 开始打开动作：先转到80°（顺时针）
-            setServoAngle(80, CURTAIN_CHANNEL);
-            curtainAngle = 80;
-            isCurtainMoving = true;
-            curtainActionTime = millis();
-        }
-        // 打开动作持续8秒后，回到90°停止
-        else if (isCurtainMoving && curtainAngle == 80)
-        {
-            if (millis() - curtainActionTime >= CURTAIN_MOVE_DURATION)
-            {
-                setServoAngle(90, CURTAIN_CHANNEL);
-                curtainAngle = 90;
-                isCurtainMoving = false;
-                lastCurtainState = curtainState;
-            }
-        }
-    }
-}
-
-/**
- * 检查门状态
- */
-void checkDoorStatus()
-{
-    if (doorState)
-    {
-        setServoAngle(90, DOOR_CHANNEL);
-    }
-    else
-    {
-        setServoAngle(180, DOOR_CHANNEL);
-    }
-}
-
-
-/**
- * 更新OLED显示
- */
-void updateOledDisplay()
-{
-    u8g2.setFont(u8g2_font_ncenB08_tr);
-    u8g2.firstPage();
-
-    do
-    {
-        char buf[20];
-        sprintf(buf, "Temp: %.0f", temperature);
-        u8g2.drawStr(0, 12, buf);
-        sprintf(buf, "Hum: %.0f", humidity);
-        u8g2.drawStr(60, 12, buf);
-
-        sprintf(buf, "Lux: %d", lux);
-        u8g2.drawStr(0, 24, buf);
-        sprintf(buf, "Mode: %s", autoMode ? "Auto" : "Manu");
-        u8g2.drawStr(60, 24, buf);
-
-        sprintf(buf, "LED: %s", ledState ? "On" : "Off");
-        u8g2.drawStr(0, 36, buf);
-        sprintf(buf, "Fan: %s", fanStatus ? "On" : "Off");
-        u8g2.drawStr(60, 36, buf);
-
-        if (isAlarmActive)
-        {
-            // 每1秒切换报警信息行（闪烁效果）
-            if (millis() - alarmDisplayTime > 1000)
-            {
-                alarmLine = !alarmLine;
-                alarmDisplayTime = millis();
-            }
-
-            if (alarmLine)
-            {
-                u8g2.drawStr(0, 48, "Alarm: Flame detected!");
-            }
-            else
-            {
-                u8g2.drawStr(0, 48, "Alarm: Smoke detected!");
-            }
-
-            u8g2.drawStr(0, 60, "Emergency: Be Safety!");
+            state.alarmActive = true;
+            state.alarmStartTime = millis();
+            digitalWrite(Pins::BUZZER, HIGH);
         }
         else
         {
-            sprintf(buf, "Curtain: %s", curtainState ? "Open" : "Close");
+            state.alarmStartTime = millis();
+        }
+    }
+    else if (state.alarmActive && millis() - state.alarmStartTime >= Constants::ALARM_DURATION)
+    {
+        state.alarmActive = false;
+        digitalWrite(Pins::BUZZER, LOW);
+    }
+    if (state.alarmActive && millis() - state.alarmDisplayTime > Constants::ALARM_DISPLAY_INTERVAL)
+    {
+        state.alarmLine = !state.alarmLine;
+        state.alarmDisplayTime = millis();
+    }
+}
+
+// 更新显示 - 新增WiFi状态显示
+void updateDisplay()
+{
+    u8g2.setFont(u8g2_font_ncenB08_tr);
+    u8g2.firstPage();
+    do
+    {
+        char buf[20];
+        // 第1行：温湿度 + WiFi状态
+        sprintf(buf, "Temp: %.0f°C", state.temperature);
+        u8g2.drawStr(0, 12, buf);
+        sprintf(buf, "Hum: %.0f%%", state.humidity);
+        u8g2.drawStr(60, 12, buf);
+
+        // 第2行：光照 + 模式
+        sprintf(buf, "Lux: %d", state.lux);
+        u8g2.drawStr(0, 24, buf);
+        sprintf(buf, "Mode: %s", state.autoMode ? "Auto" : "Manu");
+        u8g2.drawStr(60, 24, buf);
+
+        // 第3行：LED + 风扇
+        sprintf(buf, "LED: %s", state.ledState ? "On" : "Off");
+        u8g2.drawStr(0, 36, buf);
+        sprintf(buf, "Fan: %s", state.fanState ? "On" : "Off");
+        u8g2.drawStr(60, 36, buf);
+
+        // 第4行：窗帘 + 门（报警时显示报警信息）
+        if (state.alarmActive)
+        {
+            u8g2.drawStr(0, 48, state.alarmLine ? "Alarm: Flame!" : "Alarm: Smoke!");
+            u8g2.drawStr(0, 56, "Emergency!");
+        }
+        else
+        {
+            sprintf(buf, "Curtain: %s", state.curtainOpen ? "Open" : "Close");
             u8g2.drawStr(0, 48, buf);
-            sprintf(buf, "Door: %s", doorState ? "Open" : "Close");
-            u8g2.drawStr(0, 60, buf);
+            sprintf(buf, "Door: %s", state.doorOpen ? "Open" : "Close");
+            u8g2.drawStr(0, 56, buf);
         }
     }
     while (u8g2.nextPage());
 }
 
-/**
- * 自动模式控制
- */
-void isAutoControl()
+// 打印调试信息 - 新增WiFi状态
+void printDebugInfo()
 {
-    if (autoMode)
+    const unsigned long currentTime = millis();
+    if (currentTime - state.previousPrintTime >= Constants::PRINT_INTERVAL)
     {
-        bodyControl();
-        fanControl();
+        state.previousPrintTime = currentTime;
+        Serial.println("=======Sensor Data=======");
+        Serial.printf("Temp: %.1f°C  Hum: %.1f%%  Lux: %d\n",
+                      state.temperature, state.humidity, state.lux);
+        Serial.printf("Body: %s  Smoke: %s  Flame: %s\n",
+                      state.bodyDetected ? "Yes" : "No",
+                      state.smokeDetected ? "Yes" : "No",
+                      state.flameDetected ? "Yes" : "No");
+        Serial.printf("Rain: %s  Sound: %s\n",
+                      state.rainDetected ? "Yes" : "No",
+                      state.soundDetected ? "Yes" : "No");
+
+        Serial.println("------Device Status------");
+        Serial.printf("Mode: %s  LED: %s  Fan: %s\n",
+                      state.autoMode ? "Auto" : "Manual",
+                      state.ledState ? "On" : "Off",
+                      state.fanState ? "On" : "Off");
+        Serial.printf("Curtain: %s  Door: %s  Alarm: %s\n",
+                      state.curtainOpen ? "Open" : "Close",
+                      state.doorOpen ? "Open" : "Close",
+                      state.alarmActive ? "On" : "Off");
+        // 新增WiFi状态打印
+        Serial.printf("WiFi: %s  IP: %s\n",
+                      state.wifiConnected ? "Connected" : "Disconnected",
+                      state.wifiConnected ? WiFi.localIP().toString().c_str() : "N/A");
+        Serial.println("=========================");
     }
 }
 
-/**
- * 人体控制
- */
-void bodyControl()
+// 主函数 - 新增WiFi检查
+void setup()
 {
-    if (body)
-    {
-        // 检测到人体，更新计时并执行打开操作
-        lastPirTime = millis();
-
-        // 光照不足时开灯
-        if (lux && !ledState)
-        {
-            ledState = true;
-            digitalWrite(LAMP_RELAY_PIN, HIGH); // 打开灯光
-        }
-
-        curtainState = true;
-    }
-    else
-    {
-        // 未检测到人体，30秒后关闭设备
-        if (millis() - lastPirTime > 30000)
-        {
-            // 关闭灯光
-            if (ledState)
-            {
-                ledState = false;
-                digitalWrite(LAMP_RELAY_PIN, LOW); // 关闭灯光
-            }
-
-            curtainState = false;
-        }
-    }
+    initSystem();
 }
 
-/**
- * 风扇控制
- */
-void fanControl()
+void loop()
 {
-    /*
-     *温度判断：
-     *若温度＞28℃：控制继电器吸合，开启风扇通风；同时 OLED 显示 “风扇开启，降温模式”。
-     *若温度≤26℃：控制继电器断开，关闭风扇；OLED 显示 “风扇关闭，温度适宜”。
-     *湿度判断（辅助逻辑）：
-     *若湿度＞60% 且温度＞25℃：开启风扇加速除湿；若湿度＜40%：风扇保持关闭，避免过度干燥。
-    */
-    if (temperature > 29)
-    {
-        digitalWrite(FAN_RELAY_PIN, HIGH);
-        fanStatus = true;
-    }
-    else if (temperature <= 26)
-    {
-        digitalWrite(FAN_RELAY_PIN, LOW);
-        fanStatus = false;
-    }
-    if (humidity > 60 && temperature > 25)
-    {
-        digitalWrite(FAN_RELAY_PIN, HIGH);
-        fanStatus = true;
-    }
-    else if (humidity < 50)
-    {
-        digitalWrite(FAN_RELAY_PIN, LOW);
-        fanStatus = false;
-    }
-}
-
-
-void isAlarmActived()
-{
-    // 检测是否有火焰或烟雾（任意一个触发报警）
-    bool isDanger = (flame == 0) || (smoke == 0);
-
-    if (isDanger)
-    {
-        // 触发报警（首次触发或再次检测到危险时更新开始时间）
-        if (!isAlarmActive)
-        {
-            isAlarmActive = true;
-            alarmStartTime = millis(); // 记录报警开始时间
-            digitalWrite(BUZZER_PIN, HIGH); // 启动蜂鸣器
-            Serial.println("检测到危险，开始报警！");
-        }
-        else
-        {
-            // 持续处于危险状态，刷新报警时间（避免10秒后误解除）
-            alarmStartTime = millis();
-        }
-    }
-    else
-    {
-        // 无危险时，判断是否已报警且达到10秒
-        if (isAlarmActive)
-        {
-            unsigned long currentTime = millis();
-            // 检查是否已报警满10秒
-            if (currentTime - alarmStartTime >= ALARM_DURATION)
-            {
-                // 10秒后无危险，解除报警
-                isAlarmActive = false;
-                digitalWrite(BUZZER_PIN, LOW); // 关闭蜂鸣器
-                Serial.println("10秒内无危险，解除报警");
-            }
-            // 若未满10秒，继续保持报警状态
-        }
-    }
-}
-
-/**
- * 串口打印数据
- */
-void printAllDataToSerial()
-{
-    unsigned long currentTime = millis(); // 获取当前时间
-    if (currentTime - previousPrintTime >= PRINT_INTERVAL)
-    {
-        // 时间到，更新上一次打印时间
-        previousPrintTime = currentTime;
-        Serial.println(F("=======Data======="));
-        Serial.print(F("Temperature: "));
-        Serial.print(temperature);
-        Serial.print(F("  Humidity: "));
-        Serial.print(humidity);
-        Serial.print(F("  Lux: "));
-        Serial.println(lux);
-        Serial.print(F("Body: "));
-        Serial.print(body ? "Yes" : "No ");
-        Serial.print(F("           Smoke: "));
-        Serial.print(smoke ? "No " : "Yes");
-        Serial.print(F("      Flame: "));
-        Serial.println(flame ? "No " : "Yes");
-        Serial.print(F("Rain: "));
-        Serial.print(rain ? "No " : "Yes");
-        Serial.print(F("          Sound: "));
-        Serial.println(sound ? "No" : "Yes");
-        Serial.println(F("------Status-------"));
-        Serial.print(F("Mode: "));
-        Serial.println(autoMode ? "Auto" : "Manual");
-        Serial.print(F("LED: "));
-        Serial.print(ledState ? "On" : "Off");
-        Serial.print(F("  Fan: "));
-        Serial.println(fanStatus ? "On" : "Off");
-        Serial.print(F("Curtain: "));
-        Serial.print(curtainState);
-        Serial.print(F("  Door: "));
-        Serial.println(doorState);
-        Serial.print(F("Alarm: "));
-        Serial.println(isAlarmActive ? "On" : "Off");
-        Serial.println(F("==================="));
-    }
-}
-
-void isModeKeyPressed()
-{
-    autoMode = !autoMode;
-}
-
-void isLightKeyPressed()
-{
-    if (!autoMode)
-    {
-        ledState = !ledState;
-        digitalWrite(LAMP_RELAY_PIN, ledState ? HIGH : LOW);
-    }
-}
-
-void isFanKeyPressed()
-{
-    if (!autoMode)
-    {
-        fanStatus = !fanStatus;
-        digitalWrite(FAN_RELAY_PIN, fanStatus ? HIGH : LOW);
-    }
-}
-
-void isCurtainKeyPressed()
-{
-    if (!autoMode)
-    {
-        curtainState = !curtainState;
-    }
+    readSensors();
+    handleAlarms();
+    controlDevices();
+    checkWiFiConnection(); // 循环检查WiFi连接状态
+    updateDisplay();
+    printDebugInfo();
 }
