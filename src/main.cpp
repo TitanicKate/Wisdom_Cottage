@@ -4,6 +4,11 @@
 #include <DHT_U.h>
 #include <esp32-hal-ledc.h>
 #include <WiFi.h>  // 新增WiFi库
+#include <Arduino_MQTT_Client.h>
+#include <Server_Side_RPC.h>
+#include <Attribute_Request.h>
+#include <Shared_Attribute_Update.h>
+#include <ThingsBoard.h>
 
 // WiFi配置 - 新增WiFi参数
 namespace WiFiConfig
@@ -60,6 +65,44 @@ namespace Constants
     constexpr float TEMP_HUMIDITY_TRIGGER = 25.0f;
 }
 
+// ThingsBoard配置 (添加到WiFiConfig命名空间后)
+namespace ThingsBoardConfig
+{
+    const char* SERVER = "106.53.71.21";
+    const uint16_t PORT = 1883U;
+    const char* TOKEN = "qvSsCLND8g5ufB13ngPg";
+    const uint32_t MAX_MESSAGE_SIZE = 1024U;
+    const uint32_t REQUEST_TIMEOUT = 5000U * 1000U;
+    const size_t MAX_ATTRIBUTES = 5U;
+    const int TELEMETRY_INTERVAL = 2000U; // 与原有打印间隔保持一致
+}
+
+// 传感器和执行器属性名称定义 (添加到Pins命名空间后)
+namespace AttrNames
+{
+    const char* TEMP = "temperature";
+    const char* HUMIDITY = "humidity";
+    const char* LUX = "lux";
+    const char* BODY = "bodyDetected";
+    const char* SMOKE = "smokeDetected";
+    const char* FLAME = "flameDetected";
+    const char* RAIN = "rainDetected";
+    const char* SOUND = "soundDetected";
+    const char* LED = "ledState";
+    const char* FAN = "fanState";
+    const char* CURTAIN = "curtainOpen";
+    const char* DOOR = "doorOpen";
+    const char* ALARM = "alarmActive";
+    const char* RSSI = "rssi";
+    const char* CHANNEL = "channel";
+    const char* BSSID = "bssid";
+    const char* LOCALIP = "localIp";
+    const char* SSID = "ssid";
+    const char* SYSTEM_MODE = "autoMode";
+    const char* DEVICE_NAME = "deviceName";
+    const char* MAC_ADDRESS = "macAddress";
+}
+
 // 系统状态 - 新增WiFi相关状态
 struct SystemState
 {
@@ -87,6 +130,7 @@ struct SystemState
     unsigned long alarmDisplayTime = 0;
     int alarmLine = 0;
     bool lastCurtainState = false;
+    bool modeChanged = false;
 
     // 新增WiFi状态变量
     bool wifiConnected = false; // WiFi连接状态
@@ -96,6 +140,20 @@ struct SystemState
 // 全局对象 - 保留原有
 DHT_Unified dht(Pins::DHT_PIN, Constants::DHT_TYPE);
 U8G2_SSD1306_128X64_NONAME_2_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE, 22, 21);
+
+WiFiClient wifiClient;
+Arduino_MQTT_Client mqttClient(wifiClient);
+Server_Side_RPC<5U, 10U> rpc;
+Attribute_Request<2U, ThingsBoardConfig::MAX_ATTRIBUTES> attr_request;
+Shared_Attribute_Update<3U, ThingsBoardConfig::MAX_ATTRIBUTES> shared_update;
+const std::array<IAPI_Implementation*, 3U> apis = {
+    &rpc,
+    &attr_request,
+    &shared_update
+};
+
+ThingsBoard tb(mqttClient, ThingsBoardConfig::MAX_MESSAGE_SIZE, Default_Max_Stack_Size, apis);
+uint32_t previousTbSend = 0;
 
 // 函数声明 - 新增WiFi相关函数
 void initSystem();
@@ -217,7 +275,11 @@ void fanControl()
 }
 
 // 中断服务函数保持不变...
-void IRAM_ATTR onModeKeyPress() { state.autoMode = !state.autoMode; }
+void IRAM_ATTR onModeKeyPress()
+{
+    state.autoMode = !state.autoMode;
+    state.modeChanged = true;             // 标记模式已变化
+}
 
 void IRAM_ATTR onLightKeyPress()
 {
@@ -411,9 +473,9 @@ void updateDisplay()
     {
         char buf[20];
         // 第1行：温湿度 + WiFi状态
-        sprintf(buf, "Temp: %.0f°C", state.temperature);
+        sprintf(buf, "Temp: %.0f", state.temperature);
         u8g2.drawStr(0, 12, buf);
-        sprintf(buf, "Hum: %.0f%%", state.humidity);
+        sprintf(buf, "Hum: %.0f", state.humidity);
         u8g2.drawStr(60, 12, buf);
 
         // 第2行：光照 + 模式
@@ -432,14 +494,14 @@ void updateDisplay()
         if (state.alarmActive)
         {
             u8g2.drawStr(0, 48, state.alarmLine ? "Alarm: Flame!" : "Alarm: Smoke!");
-            u8g2.drawStr(0, 56, "Emergency!");
+            u8g2.drawStr(0, 60, "Emergency!");
         }
         else
         {
             sprintf(buf, "Curtain: %s", state.curtainOpen ? "Open" : "Close");
             u8g2.drawStr(0, 48, buf);
             sprintf(buf, "Door: %s", state.doorOpen ? "Open" : "Close");
-            u8g2.drawStr(0, 56, buf);
+            u8g2.drawStr(0, 60, buf);
         }
     }
     while (u8g2.nextPage());
@@ -452,8 +514,8 @@ void printDebugInfo()
     if (currentTime - state.previousPrintTime >= Constants::PRINT_INTERVAL)
     {
         state.previousPrintTime = currentTime;
-        Serial.println("=======Sensor Data=======");
-        Serial.printf("Temp: %.1f°C  Hum: %.1f%%  Lux: %d\n",
+        Serial.println("\n=======Sensor Data=======");
+        Serial.printf("Temp: %.1f  Hum: %.1f  Lux: %d\n",
                       state.temperature, state.humidity, state.lux);
         Serial.printf("Body: %s  Smoke: %s  Flame: %s\n",
                       state.bodyDetected ? "Yes" : "No",
@@ -476,7 +538,178 @@ void printDebugInfo()
         Serial.printf("WiFi: %s  IP: %s\n",
                       state.wifiConnected ? "Connected" : "Disconnected",
                       state.wifiConnected ? WiFi.localIP().toString().c_str() : "N/A");
-        Serial.println("=========================");
+        Serial.println("=========================\n");
+    }
+}
+
+void checkModeChanged()
+{
+    if (state.modeChanged) {
+        // 关闭中断，安全读取标记和新值（避免中断中途修改）
+        noInterrupts();
+        bool currentNewMode = state.autoMode;
+        state.modeChanged = false;  // 清除标记
+        interrupts();  // 恢复中断
+
+        // 更新系统模式
+        bool oldMode = state.autoMode;
+        state.autoMode = currentNewMode;
+        Serial.printf("System mode switches to: %s\n", state.autoMode ? "Auto" : "Manu");
+
+        // 仅在模式实际变化且TB连接时，发送属性和遥测
+        if (state.autoMode != oldMode && tb.connected()) {
+            // 发送属性（更新当前状态）
+            tb.sendAttributeData(AttrNames::SYSTEM_MODE, state.autoMode);
+            // 发送遥测（记录历史变化）
+            tb.sendTelemetryData(AttrNames::SYSTEM_MODE, state.autoMode);
+            Serial.println("System mode changes are synchronized to the server");
+        }
+    }
+}
+
+// RPC回调函数实现
+void processSetAutoMode(const JsonVariantConst& data, JsonDocument& response)
+{
+    bool newMode = data.as<bool>();
+    state.autoMode = newMode;
+    // 发送属性更新服务器状态
+    tb.sendAttributeData(AttrNames::SYSTEM_MODE, newMode);
+    // 返回响应
+    JsonObject responseDoc = response.to<JsonObject>();
+    responseDoc["success"] = true;
+    responseDoc["currentMode"] = newMode ? "auto" : "manual";
+}
+
+void processSetLedState(const JsonVariantConst& data, JsonDocument& response)
+{
+    bool newState = data.as<bool>();
+    state.ledState = newState;
+    digitalWrite(Pins::LAMP_RELAY, newState ? HIGH : LOW);
+
+    JsonObject responseDoc = response.to<JsonObject>();
+    responseDoc["success"] = true;
+    responseDoc["newState"] = newState;
+    response.set(responseDoc);
+    Serial.printf("LED state set to %s\n", newState ? "ON" : "OFF");
+}
+
+void processSetFanState(const JsonVariantConst& data, JsonDocument& response)
+{
+    bool newState = data.as<bool>();
+    state.fanState = newState;
+    digitalWrite(Pins::FAN_RELAY, newState ? HIGH : LOW);
+
+    JsonObject responseDoc = response.to<JsonObject>();
+    responseDoc["success"] = true;
+    responseDoc["newState"] = newState;
+    response.set(responseDoc);
+}
+
+void processSetCurtainState(const JsonVariantConst& data, JsonDocument& response)
+{
+    bool newState = data.as<bool>();
+    state.curtainOpen = newState;
+
+    JsonObject responseDoc = response.to<JsonObject>();
+    responseDoc["success"] = true;
+    responseDoc["newState"] = newState;
+    response.set(responseDoc);
+}
+
+void processSetDoorState(const JsonVariantConst& data, JsonDocument& response)
+{
+    bool newState = data.as<bool>();
+    state.doorOpen = newState;
+
+    JsonObject responseDoc = response.to<JsonObject>();
+    responseDoc["success"] = true;
+    responseDoc["newState"] = newState;
+    response.set(responseDoc);
+}
+
+// RPC回调列表 (添加到RPC回调函数后)
+const std::array<RPC_Callback, 5U> tbCallbacks = {
+    RPC_Callback{"setAutoMode", processSetAutoMode},
+    RPC_Callback{"setLedState", processSetLedState},
+    RPC_Callback{"setFanState", processSetFanState},
+    RPC_Callback{"setCurtainState", processSetCurtainState},
+    RPC_Callback{"setDoorState", processSetDoorState}
+};
+
+// ThingsBoard连接和数据发送函数
+void connectThingsBoard()
+{
+    if (!tb.connected())
+    {
+        Serial.print("Connecting to ThingsBoard server: ");
+        Serial.println(ThingsBoardConfig::SERVER);
+
+        if (tb.connect(ThingsBoardConfig::SERVER, ThingsBoardConfig::TOKEN, ThingsBoardConfig::PORT))
+        {
+            Serial.println("Connected to ThingsBoard!");
+
+            // 订阅RPC命令
+            if (!rpc.RPC_Subscribe(tbCallbacks.cbegin(), tbCallbacks.cend()))
+            {
+                Serial.println("Failed to subscribe for RPC");
+            }
+            else
+            {
+                Serial.println("Successfully subscribed for RPC");
+                for (const auto& callback : tbCallbacks)
+                {
+                    Serial.printf("RPC callback for %s registered\n", callback.Get_Name());
+                }
+            }
+
+            // 发送设备信息
+            tb.sendAttributeData(AttrNames::DEVICE_NAME, "SmartLivingRoom");
+            tb.sendAttributeData(AttrNames::MAC_ADDRESS, WiFi.macAddress().c_str());
+            tb.sendAttributeData(AttrNames::SYSTEM_MODE, state.autoMode);
+            Serial.printf("Initial system mode: %s，Synced to the server\n", state.autoMode ? "Auto" : "Manual");
+        }
+        else
+        {
+            Serial.print("Failed to connect to ThingsBoard");
+        }
+    }
+}
+
+void sendTelemetryData()
+{
+    if (tb.connected() && millis() - previousTbSend > ThingsBoardConfig::TELEMETRY_INTERVAL)
+    {
+        previousTbSend = millis();
+
+        // 发送传感器数据
+        tb.sendTelemetryData(AttrNames::TEMP, state.temperature);
+        tb.sendTelemetryData(AttrNames::HUMIDITY, state.humidity);
+        tb.sendTelemetryData(AttrNames::LUX, state.lux);
+        tb.sendTelemetryData(AttrNames::BODY, state.bodyDetected);
+        tb.sendTelemetryData(AttrNames::SMOKE, state.smokeDetected);
+        tb.sendTelemetryData(AttrNames::FLAME, state.flameDetected);
+        tb.sendTelemetryData(AttrNames::RAIN, state.rainDetected);
+        tb.sendTelemetryData(AttrNames::SOUND, state.soundDetected);
+
+        // 发送执行器状态
+        tb.sendTelemetryData(AttrNames::LED, state.ledState);
+        tb.sendTelemetryData(AttrNames::FAN, state.fanState);
+        tb.sendTelemetryData(AttrNames::CURTAIN, state.curtainOpen);
+        tb.sendTelemetryData(AttrNames::DOOR, state.doorOpen);
+        tb.sendTelemetryData(AttrNames::ALARM, state.alarmActive);
+
+        // 发送属性数据
+        tb.sendAttributeData(AttrNames::SYSTEM_MODE, state.autoMode);
+        tb.sendAttributeData(AttrNames::LED, state.ledState);
+        tb.sendAttributeData(AttrNames::FAN, state.fanState);
+        tb.sendAttributeData(AttrNames::CURTAIN, state.curtainOpen);
+        tb.sendAttributeData(AttrNames::DOOR, state.doorOpen);
+
+        tb.sendAttributeData(AttrNames::RSSI, WiFi.RSSI());
+        tb.sendAttributeData(AttrNames::CHANNEL, WiFi.channel());
+        tb.sendAttributeData(AttrNames::BSSID, WiFi.BSSIDstr().c_str());
+        tb.sendAttributeData(AttrNames::LOCALIP, WiFi.localIP().toString().c_str());
+        tb.sendAttributeData(AttrNames::SSID, WiFi.SSID().c_str());
     }
 }
 
@@ -491,7 +724,17 @@ void loop()
     readSensors();
     handleAlarms();
     controlDevices();
-    checkWiFiConnection(); // 循环检查WiFi连接状态
+    checkWiFiConnection();
+
+    // 新增ThingsBoard相关操作
+    if (state.wifiConnected)
+    {
+        connectThingsBoard();
+        checkModeChanged();
+        tb.loop();
+        sendTelemetryData();
+    }
+
     updateDisplay();
     printDebugInfo();
 }
